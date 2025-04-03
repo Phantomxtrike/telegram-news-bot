@@ -1,4 +1,4 @@
-# Script Version: 1.12 (Priming Limit = 1)
+# Script Version: 1.15 (Updated Filter Keywords)
 
 # === Import Necessary Libraries ===
 
@@ -7,12 +7,8 @@ import time
 import logging   
 import asyncio   
 import threading 
-# --- Removed escape_markdown import ---
-# from telegram.helpers import escape_markdown 
 from flask import Flask 
 from telegram import Bot 
-# --- Removed ParseMode import ---
-# from telegram.constants import ParseMode 
 from telegram.error import TelegramError 
 from datetime import datetime, timezone 
 
@@ -26,7 +22,8 @@ NEWS_SOURCES = [
     # Existing Feeds
     ("CNA", "https://www.channelnewsasia.com/api/v1/rss-outbound-feed?_format=xml"),
     ("Mothership", "https://mothership.sg/feed/"),
-
+    # ("Today Online", "https://www.todayonline.com/rss"), # Removed previously
+    
     # Added Straits Times Feeds
     ("ST World", "https://www.straitstimes.com/news/world/rss.xml"),
     ("ST Business", "https://www.straitstimes.com/news/business/rss.xml"),
@@ -36,8 +33,8 @@ NEWS_SOURCES = [
     ("ST Asia", "https://www.straitstimes.com/news/asia/rss.xml"),
     ("ST Tech", "https://www.straitstimes.com/news/tech/rss.xml"),
     ("ST Multimedia", "https://www.straitstimes.com/news/multimedia/rss.xml"),
-    ("ST Newsletter", "https://www.straitstimes.com/news/newsletter/rss.xml"), # Note: Newsletters might not update like regular news
-
+    ("ST Newsletter", "https://www.straitstimes.com/news/newsletter/rss.xml"), 
+    
     # Added Business Times Feeds
     ("BT Singapore", "https://www.businesstimes.com.sg/rss/singapore"), 
     ("BT International", "https://www.businesstimes.com.sg/rss/international"),
@@ -55,17 +52,27 @@ NEWS_SOURCES = [
     ("BT Top Stories", "https://www.businesstimes.com.sg/rss/top-stories"),
 ]
 
+# --- Keyword Filtering ---
+# Add keywords here (case-insensitive). Only articles with titles containing
+# at least one of these keywords will be posted.
+# Leave the list empty [] to disable filtering and post all news.
+# --- UPDATED Keywords ---
+FILTER_KEYWORDS = [
+    "mediacorp", 
+    "mewatch", 
+    "melisten", 
+    # Add more keywords as needed, separated by commas
+] 
+
 # --- Timing and Limits ---
 FETCH_INTERVAL_SECONDS = 1800 # 30 minutes 
 SEND_DELAY_SECONDS = 5 
-# --- UPDATED: How many of the newest articles *per source* to post during the first priming run ---
-INITIAL_POST_LIMIT_PER_SOURCE = 1 # Changed from 5 to 1
+INITIAL_POST_LIMIT_PER_SOURCE = 1 
 
 # --- Global State Variables ---
 bot = Bot(token=TOKEN)
 posted_links = set() 
 app = Flask(__name__)
-# Set logging level back to INFO unless debugging needed
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
@@ -83,18 +90,21 @@ def get_entry_datetime(entry):
 
 # --- Asynchronous Bot Logic ---
 async def fetch_and_post_news(prime_run=False): 
-    """Fetch feeds. If prime_run, post top N newest per source (plain text). If not, post new (plain text)."""
+    """Fetch feeds. If prime_run, post top N newest per source (plain text). If not, post new (plain text). Applies keyword filter."""
     log_prefix = "[Priming Run]" if prime_run else "[News Check]"
     logger.info(f"{log_prefix} Starting news fetch cycle for {len(NEWS_SOURCES)} sources.")
-
+    
     posted_links_before_run = posted_links.copy() 
     total_articles_posted_this_run = 0 
 
+    # Convert filter keywords to lowercase once for efficiency
+    filter_keywords_lower = [kw.lower() for kw in FILTER_KEYWORDS]
+
     for source_name, feed_url in NEWS_SOURCES:
-        await asyncio.sleep(1) # Slight delay between feed fetches
+        await asyncio.sleep(1) 
         logger.info(f"{log_prefix} Processing feed: [{source_name}] {feed_url}")
         articles_posted_this_feed_this_run = 0 
-
+        
         try:
             feed = feedparser.parse(feed_url)
             if feed.bozo:
@@ -107,7 +117,18 @@ async def fetch_and_post_news(prime_run=False):
                      continue 
 
                 link_was_already_posted = entry.link in posted_links 
+                entry_title = getattr(entry, 'title', 'No Title') 
+                title_lower = entry_title.lower() # Lowercase title for case-insensitive matching
 
+                # --- Keyword Check ---
+                keywords_found = False
+                if not filter_keywords_lower: 
+                    keywords_found = True
+                else:
+                    if any(keyword in title_lower for keyword in filter_keywords_lower):
+                        keywords_found = True
+                
+                # Record link only if it's truly new
                 if not link_was_already_posted:
                     posted_links.add(entry.link)
                     if prime_run:
@@ -116,27 +137,29 @@ async def fetch_and_post_news(prime_run=False):
                 # --- Posting Logic ---
                 should_post = False
                 message = "" 
-                current_parse_mode = None # Sending as plain text
+                current_parse_mode = None 
 
-                entry_title = getattr(entry, 'title', 'No Title') 
+                # Only proceed if keywords are found (or filtering is disabled)
+                if keywords_found:
+                    if prime_run:
+                        if articles_posted_this_feed_this_run < INITIAL_POST_LIMIT_PER_SOURCE and not link_was_already_posted:
+                            should_post = True
+                            message = f"✨ [{source_name}] {entry_title}\n{entry.link}" 
+                    else: # Normal run
+                        if entry.link not in posted_links_before_run:
+                            should_post = True
+                            message = f"📰 [{source_name}] {entry_title}\n{entry.link}" 
+                # Log if filtered out (and was new)
+                elif not link_was_already_posted: 
+                     logger.info(f"{log_prefix} [{source_name}] Skipping article (keywords not found): {entry_title}")
 
-                if prime_run:
-                    # Check if limit for this feed is reached AND link wasn't posted before this script start
-                    if articles_posted_this_feed_this_run < INITIAL_POST_LIMIT_PER_SOURCE and not link_was_already_posted:
-                        should_post = True
-                        message = f"✨ [{source_name}] {entry_title}\n{entry.link}" 
-                else: # Normal run
-                    # Post if link wasn't known before this cycle started
-                    if entry.link not in posted_links_before_run:
-                        should_post = True
-                        message = f"📰 [{source_name}] {entry_title}\n{entry.link}" 
 
                 # --- Send message if needed ---
                 if should_post:
                     logger.info(f"{log_prefix} [{source_name}] Preparing to post article: {entry_title}")
                     try:
                         logger.debug(f"Sending message with parse_mode='{current_parse_mode}':\n{message}") 
-
+                        
                         await bot.send_message(
                             chat_id=CHANNEL_ID, 
                             text=message, 
@@ -164,7 +187,7 @@ async def fetch_and_post_news(prime_run=False):
 async def main_bot_loop():
     """Main asynchronous loop that periodically calls the news fetching function. Includes initial priming."""
     priming_done = False 
-
+    
     while True:
         try:
             if not priming_done:
@@ -174,10 +197,10 @@ async def main_bot_loop():
                 logger.info(f"Priming complete. {len(posted_links)} links recorded.")
             else:
                 await fetch_and_post_news(prime_run=False) 
-
+                
         except Exception as e:
             logger.error(f"Error in main loop cycle: {e}", exc_info=True) 
-
+        
         logger.info(f"Sleeping for {FETCH_INTERVAL_SECONDS} seconds...")
         await asyncio.sleep(FETCH_INTERVAL_SECONDS)
 
@@ -189,21 +212,34 @@ def home():
 
 def run_flask():
   """Runs the Flask web server."""
-  app.run(host='0.0.0.0', port=8080) 
+  # Check if Flask app object exists
+  if app:
+      app.run(host='0.0.0.0', port=8080) 
+  else:
+      logger.error("Flask app object not initialized.")
 
 # --- Main Execution Block ---
 if __name__ == "__main__":
+    # Setup logger first
     logger.info("Starting multi-source news bot...")
 
-    logger.info("Starting Flask server in background thread...")
-    flask_thread = threading.Thread(target=run_flask)
-    flask_thread.daemon = True 
-    flask_thread.start()
-
-    logger.info("Starting main news checking loop (includes priming on first iteration)...")
-    try:
-        asyncio.run(main_bot_loop()) 
-    except KeyboardInterrupt:
-        logger.info("Bot stopped manually.")
-    except Exception as e:
-        logger.critical(f"Bot crashed in main loop: {e}", exc_info=True) 
+    # Check essential config before proceeding (Token/Channel ID check from v1.14)
+    if not TOKEN or not CHANNEL_ID:
+        logger.critical("TOKEN or CHANNEL_ID missing in environment variables. Cannot start.")
+        exit()
+    elif not bot:
+         logger.critical("Bot initialization failed (likely missing TOKEN). Cannot start.")
+         exit()
+    else:
+        logger.info("Starting Flask server in background thread...")
+        flask_thread = threading.Thread(target=run_flask)
+        flask_thread.daemon = True 
+        flask_thread.start()
+        
+        logger.info("Starting main news checking loop (includes priming on first iteration)...")
+        try:
+            asyncio.run(main_bot_loop()) 
+        except KeyboardInterrupt:
+            logger.info("Bot stopped manually.")
+        except Exception as e:
+            logger.critical(f"Bot crashed in main loop: {e}", exc_info=True) 
