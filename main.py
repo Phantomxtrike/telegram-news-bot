@@ -61,6 +61,7 @@ FILTER_KEYWORDS = [
     "mediacorp", 
     "mewatch", 
     "melisten", 
+    "trump",
     # Add more keywords as needed, separated by commas
 ] 
 
